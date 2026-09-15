@@ -20,7 +20,7 @@
   },
   "autoIncrementOnCICD": {
     "enabled": false,
-    "branches": [ "develop" ],
+    "branches": [ "OnPrem" ],
     "versionIncrement": "+0.0.1"
   }
 }
