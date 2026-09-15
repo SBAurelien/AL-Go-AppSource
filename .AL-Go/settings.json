@@ -6,5 +6,14 @@
   ],
   "appFolders": [],
   "testFolders": [],
-  "bcptTestFolders": []
+  "bcptTestFolders": [],
+  "DeployTo<EnvironmentName>": {
+    "deploymentSchedule": "Immediate",
+    "deployAfterRelease": false
+  },
+  "autoReleaseOnMerge": {
+    "enabled": false,
+    "branches": [ "main" ],
+    "workflowType": "ReleaseWithDeploy"
+  }
 }
