@@ -1,0 +1,187 @@
+name: ' Auto Release On Merge'
+
+# Reacts to every merged PR, on every branch (GitHub requires this trigger filter to be static
+# YAML - it can't read settings.json before the job starts). The enabled/branch check happens
+# inside the job itself, driven by the "autoReleaseOnMerge" setting - see
+# DEPLOYMENT-SCHEDULING.md for details and known limitations.
+#
+# Deliberately scoped to real PR merges only (not "any CI/CD success" - that would also fire on
+# CI/CD's own scheduled/nightly runs and manual dispatches, with no merge involved at all). To
+# still guarantee the release is only created from a validated commit, the job waits for the
+# CI/CD run on the exact merge commit to complete successfully before triggering the release,
+# instead of firing immediately and racing the asynchronous CI/CD run that starts right after
+# the merge - see DEPLOYMENT-SCHEDULING.md for the incident this avoids.
+on:
+  pull_request:
+    types: [ closed ]
+
+# A duplicate delivery of the same PR-closed event would still be caught correctly by the
+# existing "does a release for this tag already exist" guard further down (the second one just
+# skips) - but without this, both would independently run the full 90-minute CI/CD-wait poll in
+# parallel first, wasting a runner slot for nothing. Confirmed elsewhere (AutoIncrementOnCICD.yaml,
+# 16/09/2026) that GitHub can redeliver the same event multiple times, so this is cheap insurance.
+concurrency:
+  group: auto-release-on-merge-${{ github.event.pull_request.number }}-${{ github.event.pull_request.merge_commit_sha }}
+  cancel-in-progress: false
+
+permissions:
+  # actions: write is required by "gh workflow run" (creating a workflow_dispatch event) -
+  # confirmed via a real 403 "Resource not accessible by integration" on AutoIncrementOnCICD.yaml
+  # with actions: read alone; both workflows dispatch other workflows the same way.
+  actions: write
+  contents: read
+
+jobs:
+  CheckAndTriggerRelease:
+    if: github.event.pull_request.merged == true
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
+
+      - name: Read settings
+        id: ReadSettings
+        uses: microsoft/AL-Go-Actions/ReadSettings@v9.2
+        with:
+          shell: powershell
+
+      - name: Check settings and trigger release if enabled
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BaseRef: ${{ github.event.pull_request.base.ref }}
+          HeadRef: ${{ github.event.pull_request.head.ref }}
+          MergeSha: ${{ github.event.pull_request.merge_commit_sha }}
+          Repository: ${{ github.repository }}
+        run: |
+          $errorActionPreference = "Stop"; $ProgressPreference = "SilentlyContinue"; Set-StrictMode -Version 2.0
+
+          $settings = $env:Settings | ConvertFrom-Json
+          # Use Select-Object -ExpandProperty (not dot notation) - autoReleaseOnMerge is a custom
+          # setting AL-Go itself knows nothing about, so branches/settings.json files that don't
+          # define it at all won't have the property present. Under Set-StrictMode -Version 2.0,
+          # referencing a genuinely absent property via dot notation throws; -ErrorAction
+          # SilentlyContinue here just yields $null instead, treated as "not configured" below.
+          $auto = $settings | Select-Object -ErrorAction SilentlyContinue -ExpandProperty autoReleaseOnMerge
+
+          if (-not $auto -or -not $auto.enabled) {
+              Write-Host "autoReleaseOnMerge is not enabled (or not configured), nothing to do."
+              exit 0
+          }
+
+          $branches = @($auto.branches)
+          if ($branches -notcontains $env:BaseRef) {
+              Write-Host "PR was merged into '$($env:BaseRef)', which is not in autoReleaseOnMerge.branches ($($branches -join ', ')). Nothing to do."
+              exit 0
+          }
+
+          # Wait for CI/CD to complete (successfully) on the exact merge commit before releasing.
+          # CI/CD is triggered asynchronously by the push that the merge produces, so it may not
+          # exist yet the moment this job starts - poll for it instead of assuming it's already
+          # there. This only waits for the run tied to *this* merge commit, not just any CI/CD
+          # success, so a scheduled/nightly CI/CD run elsewhere never triggers a release here.
+          $timeoutMinutes = 90
+          $pollSeconds = 30
+          $deadline = (Get-Date).AddMinutes($timeoutMinutes)
+          Write-Host "Waiting (up to $timeoutMinutes minutes) for CI/CD to succeed on merge commit $($env:MergeSha)..."
+
+          $run = $null
+          while ((Get-Date) -lt $deadline) {
+              $runs = gh run list --workflow "CI/CD" --branch $env:BaseRef --json headSha,status,conclusion,databaseId --limit 50 | ConvertFrom-Json
+              $run = $runs | Where-Object { $_.headSha -eq $env:MergeSha } | Select-Object -First 1
+              if ($run -and $run.status -eq 'completed') {
+                  break
+              }
+              Start-Sleep -Seconds $pollSeconds
+          }
+
+          if (-not $run) {
+              throw "No CI/CD run found for merge commit $($env:MergeSha) within $timeoutMinutes minutes. Aborting - cannot confirm this merge was validated. Check the Actions tab and re-run this workflow manually once CI/CD has completed if needed."
+          }
+          if ($run.status -ne 'completed') {
+              throw "CI/CD run $($run.databaseId) for merge commit $($env:MergeSha) did not complete within $timeoutMinutes minutes (still '$($run.status)'). Aborting - no release was triggered."
+          }
+          if ($run.conclusion -ne 'success') {
+              throw "CI/CD run $($run.databaseId) for merge commit $($env:MergeSha) finished with conclusion '$($run.conclusion)', not 'success'. Aborting - no release was triggered for an unvalidated commit."
+          }
+          Write-Host "CI/CD run $($run.databaseId) succeeded on merge commit $($env:MergeSha). Proceeding."
+
+          # Derive the release tag from the main app's version in app.json, preserving all 4
+          # segments - do NOT collapse it to a 3-segment "Major.Minor.0" shape. Unlike a generic
+          # build/revision counter, every segment here can carry real meaning (e.g. a product
+          # major/CU/fix scheme plus a manually-set BC-compatibility marker) - rewriting the
+          # version would silently discard that. See DEPLOYMENT-SCHEDULING.md.
+          # Heuristic: first app.json found, excluding folders that look like test/performance apps.
+          # If your repo layout doesn't match this assumption, adjust this section.
+          $appJsonFile = Get-ChildItem -Path . -Recurse -Filter "app.json" -File |
+              Where-Object { $_.FullName -notmatch '\.(Test|PerformanceTest)\\' -and $_.FullName -notmatch '\\\.(altemplates|dependencies|alpackages)\\' } |
+              Select-Object -First 1
+
+          if (-not $appJsonFile) {
+              throw "Could not find a main app.json to derive the release tag from. Adjust the heuristic in this workflow for your repo layout."
+          }
+
+          $appJson = Get-Content $appJsonFile.FullName -Raw | ConvertFrom-Json
+          try {
+              $version = [System.Version]$appJson.version
+          } catch {
+              throw "app.json version '$($appJson.version)' in $($appJsonFile.FullName) is not a valid version string."
+          }
+          # A plain 4-segment tag (e.g. "1.9.2.0") is NOT valid SemVer and breaks CreateReleaseNotes
+          # ("'1.9.2.0' cannot be recognized as a semantic version string") - confirmed on a real
+          # run, from AL-Go-Actions/Github-Helper.psm1's SemVerStrToSemVerObj, which parses only
+          # Major.Minor.Patch then, optionally, "-<additional segments separated by '.'>". Putting
+          # the 4th segment after a dash keeps it fully valid SemVer while still preserving it
+          # losslessly (e.g. "1.9.2-0" instead of "1.9.2.0").
+          $tag = "$($version.Major).$($version.Minor).$($version.Build)-$($version.Revision)"
+          Write-Host "Derived tag '$tag' from $($appJsonFile.FullName)"
+
+          # If app.json's version hasn't changed since the last release, this merge didn't bump
+          # it (e.g. no version-bump policy was applied in the PR) - skip rather than fail on a
+          # duplicate tag.
+          # "gh release view" writes to stderr and exits non-zero when the tag doesn't exist yet -
+          # the expected, common case here. Under $ErrorActionPreference = "Stop", Windows
+          # PowerShell 5.1 turns that stderr write into a terminating NativeCommandError even with
+          # 2>$null redirection - confirmed by a real run crashing here on a brand new tag.
+          # Temporarily relax it so $LASTEXITCODE can actually be checked.
+          $previousEAP = $errorActionPreference
+          $errorActionPreference = "SilentlyContinue"
+          gh release view $tag --json tagName 1>$null 2>$null
+          $releaseAlreadyExists = ($LASTEXITCODE -eq 0)
+          $errorActionPreference = $previousEAP
+          if ($releaseAlreadyExists) {
+              Write-Host "A release tagged '$tag' already exists - app.json version wasn't bumped since the last release. Nothing to do."
+              exit 0
+          }
+
+          $workflowFile = if ($auto.workflowType -eq 'ReleaseWithDeploy') { 'CreateReleaseWithDeploy.yaml' } else { 'CreateRelease.yaml' }
+
+          Write-Host "Triggering workflow '$workflowFile' on branch '$($env:BaseRef)' with tag '$tag'"
+          gh workflow run $workflowFile `
+              --ref $env:BaseRef `
+              -f buildVersion=latest `
+              -f name="Release $tag" `
+              -f tag=$tag `
+              -f releaseType=Release
+
+          # app.json on $BaseRef (main) stays frozen at the version that was just released - it
+          # must never be bumped here. Instead, bump the version on the branch this PR came FROM
+          # (the persistent development branch, e.g. "develop"), so ongoing work already targets
+          # the next version. Controlled by autoReleaseOnMerge.versionIncrement, defaulting to
+          # "+0.0.1" (advances the build/fix segment only) if not set. See DEPLOYMENT-SCHEDULING.md.
+          $versionIncrement = if ($auto.versionIncrement) { $auto.versionIncrement } else { '+0.0.1' }
+
+          gh api "repos/$($env:Repository)/branches/$($env:HeadRef)" 1>$null 2>$null
+          if ($LASTEXITCODE -ne 0) {
+              Write-Host "::warning::Development branch '$($env:HeadRef)' no longer exists (deleted on merge?) - skipping automatic version increment. Bump it manually if needed."
+          } else {
+              Write-Host "Incrementing version by '$versionIncrement' on development branch '$($env:HeadRef)'"
+              gh workflow run IncrementVersionNumber.yaml `
+                  --ref $env:HeadRef `
+                  -f versionNumber=$versionIncrement `
+                  -f directCommit=true
+          }
